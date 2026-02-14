@@ -862,6 +862,139 @@ static void TryResolveShareUrl(NSString *urlString, void (^successHandler)(NSStr
 
 %end
 
+static NSString *ApolloExtractGiphyIDFromToken(NSString *token) {
+    if (![token isKindOfClass:[NSString class]] || token.length == 0) {
+        return nil;
+    }
+    NSRange prefixRange = [token rangeOfString:@"giphy|"];
+    if (prefixRange.location == NSNotFound) {
+        return nil;
+    }
+    NSString *suffix = [token substringFromIndex:(prefixRange.location + prefixRange.length)];
+    if (suffix.length == 0) {
+        return nil;
+    }
+    NSRange nextPipe = [suffix rangeOfString:@"|"];
+    NSString *giphyID = (nextPipe.location == NSNotFound) ? suffix : [suffix substringToIndex:nextPipe.location];
+    return giphyID.length > 0 ? giphyID : nil;
+}
+
+static BOOL ApolloIsValidGiphyID(NSString *giphyID) {
+    if (![giphyID isKindOfClass:[NSString class]] || giphyID.length == 0) {
+        return NO;
+    }
+    // Giphy IDs are alphanumeric with possible underscores/dashes
+    for (NSUInteger i = 0; i < giphyID.length; i++) {
+        unichar c = [giphyID characterAtIndex:i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) {
+            return NO;
+        }
+    }
+    return YES;
+}
+
+%hook RDKComment
+
+// Fix invalid giphy media_metadata entries by synthesizing valid-looking metadata
+// with direct giphy CDN URLs.
+- (NSDictionary *)mediaMetadata {
+    NSDictionary *orig = %orig;
+    if (![orig isKindOfClass:[NSDictionary class]] || orig.count == 0) {
+        return orig;
+    }
+
+    NSMutableDictionary *fixed = nil;
+    for (NSString *key in orig) {
+        if (![key isKindOfClass:[NSString class]] || ![key hasPrefix:@"giphy|"]) {
+            continue;
+        }
+        NSDictionary *entry = orig[key];
+        if (![entry isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        NSString *status = entry[@"status"];
+        if ([status isKindOfClass:[NSString class]] && [status isEqualToString:@"valid"]) {
+            continue;
+        }
+
+        // This entry is invalid/missing — synthesize valid metadata
+        NSString *giphyID = ApolloExtractGiphyIDFromToken(key);
+        if (!ApolloIsValidGiphyID(giphyID)) {
+            continue;
+        }
+
+        if (!fixed) {
+            fixed = [orig mutableCopy];
+        }
+
+        NSString *extURL = [NSString stringWithFormat:@"https://giphy.com/gifs/%@", giphyID];
+        NSString *gifURL = [NSString stringWithFormat:@"https://media.giphy.com/media/%@/giphy.gif", giphyID];
+        NSString *thumbURL = [NSString stringWithFormat:@"https://media.giphy.com/media/%@/200w_s.gif", giphyID];
+
+        fixed[key] = @{
+            @"status": @"valid",
+            @"e": @"AnimatedImage",
+            @"m": @"image/gif",
+            @"ext": extURL,
+            @"p": @[@{@"y": @200, @"x": @200, @"u": thumbURL}],
+            // Must use gifURL for 'mp4' or else will open in webview
+            @"s": @{@"y": @200, @"gif": gifURL, @"mp4": gifURL, @"x": @200},
+            @"t": @"giphy",
+            @"id": key,
+        };
+        ApolloLog(@"[Giphy] Synthesized valid metadata for %@ (ID: %@)", key, giphyID);
+    }
+
+    return fixed ?: orig;
+}
+
+// Fix "Processing img <id>..." placeholder text in comments where media_metadata has valid data.
+// Reddit's API sometimes returns body/body_html with unprocessed placeholder text even though
+// the media_metadata dictionary contains fully resolved image URLs.
+
+- (NSString *)body {
+    NSString *text = %orig;
+    if (!text || ![text containsString:@"Processing img "]) return text;
+
+    NSDictionary *metadata = self.mediaMetadata;
+    if (![metadata isKindOfClass:[NSDictionary class]] || metadata.count == 0) return text;
+
+    NSMutableString *fixed = [text mutableCopy];
+    static NSRegularExpression *regex;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        regex = [NSRegularExpression regularExpressionWithPattern:@"\\*Processing img ([a-zA-Z0-9_]+)\\.{3}\\*" options:0 error:nil];
+    });
+    NSArray *matches = [regex matchesInString:fixed options:0 range:NSMakeRange(0, fixed.length)];
+
+    for (NSTextCheckingResult *match in [matches reverseObjectEnumerator]) {
+        NSString *mediaId = [fixed substringWithRange:[match rangeAtIndex:1]];
+        NSDictionary *entry = metadata[mediaId];
+        if (![entry isKindOfClass:[NSDictionary class]]) continue;
+        if (![[entry objectForKey:@"status"] isEqualToString:@"valid"]) continue;
+
+        NSDictionary *source = entry[@"s"];
+        if (![source isKindOfClass:[NSDictionary class]]) continue;
+
+        NSString *url = source[@"mp4"] ?: source[@"gif"] ?: source[@"u"];
+        if (!url) {
+            NSArray *previews = entry[@"p"];
+            if ([previews isKindOfClass:[NSArray class]] && previews.count > 0) {
+                url = [previews.lastObject objectForKey:@"u"];
+            }
+        }
+        if (![url isKindOfClass:[NSString class]] || url.length == 0) continue;
+
+        NSString *label = [[entry objectForKey:@"e"] isEqualToString:@"AnimatedImage"] ? @"GIF" : @"Image";
+        NSString *replacement = [NSString stringWithFormat:@"[%@](%@)", label, url];
+        [fixed replaceCharactersInRange:match.range withString:replacement];
+    }
+
+    return fixed;
+}
+
+%end
+
 // Replace Reddit API client ID
 %hook RDKOAuthCredential
 
